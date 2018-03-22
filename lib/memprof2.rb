@@ -1,41 +1,52 @@
 require 'objspace'
 
 class Memprof2
-  class << self
-    def start
-      ObjectSpace.trace_object_allocations_start
-    end
+  def start
+    ObjectSpace.trace_object_allocations_start
 
-    def stop
-      ObjectSpace.trace_object_allocations_stop
-      ObjectSpace.trace_object_allocations_clear
-    end
+    @call_trace = TracePoint.new(:call, :return) do |tp|
+      unless tp.path.include?('memprof2')
+        @call_trace = [] if @trace.nil?
+        @trace = [] if @trace.nil?
 
-    def run(&block)
-      ObjectSpace.trace_object_allocations(&block)
-    end
-
-    def report(opts = {})
-      ObjectSpace.trace_object_allocations_stop
-      self.new.report(opts)
-    ensure
-      ObjectSpace.trace_object_allocations_start
-    end
-
-    def report!(opts = {})
-      report(opts)
-      ObjectSpace.trace_object_allocations_clear
-    end
-  end
-
-  def report(opts={})
-    configure(opts)
-    results = collect_info
-    File.open(@out, 'a') do |io|
-      results.each do |location, memsize|
-        io.puts "#{memsize} #{location}"
+        if tp.event == :call
+          @call_trace << [tp.event, tp.lineno]
+        elsif @call_trace.length >= 1
+          children = []
+          while @call_trace.last[0] != :call
+            children << @call_trace.pop
+          end
+          @call_trace << {file: tp.path, start: @call_trace.pop[1], end: tp.lineno, method: tp.method_id, children: children}
+        end
       end
     end
+    @call_trace.enable
+  end
+
+  def stop
+    ObjectSpace.trace_object_allocations_stop
+    ObjectSpace.trace_object_allocations_clear
+  end
+
+  def run(&block)
+    ObjectSpace.trace_object_allocations(&block)
+  end
+
+  def report(opts = {})
+    ObjectSpace.trace_object_allocations_stop
+    do_report(opts)
+  ensure
+    ObjectSpace.trace_object_allocations_start
+  end
+
+  def do_report(opts={})
+    configure(opts)
+    results = collect_info
+    # File.open(@out, 'a') do |io|
+    #   results.each do |location, memsize|
+    #     io.puts "#{memsize} #{location}"
+    #   end
+    # end
   end
 
   def configure(opts = {})
@@ -57,6 +68,7 @@ class Memprof2
       next if file == __FILE__
       next if (@trace  and @trace !~ file)
       next if (@ignore and @ignore =~ file)
+
       line = ObjectSpace.allocation_sourceline(o)
       if RUBY_VERSION >= "2.2.0"
         # Ruby 2.2.0 takes into account sizeof(RVALUE)
@@ -70,10 +82,27 @@ class Memprof2
       memsize = @rvalue_size if memsize > 100_000_000_000 # compensate for API bug
       klass = o.class.name rescue "BasicObject"
       location = "#{file}:#{line}:#{klass}"
-      results[location] ||= 0
-      results[location] += memsize
+      results[location] ||= {mem: 0, file: file, line: line, class: klass}
+      results[location][:mem] += memsize
     end
-    results
+
+    results.each {|r| add_to_trace(r[1])}
+    puts @call_trace.inspect
+  end
+
+  def add_to_trace(result, parent=@call_trace)
+    return false if parent == []
+    parent.each do |trace|
+      if trace[:file] == result[:file] && result[:line] < trace[:end] && result[:line] > trace[:start]
+        if !add_to_trace(result, trace[:children])
+          trace[:allocations] ||= []
+          trace[:allocations] << result
+          return true
+        end
+        return false
+      end
+      add_to_trace(result, trace[:children])
+    end
   end
 end
 
